@@ -28,18 +28,18 @@ tables below, and install both together.
 <!-- airos-ci:latest-builds:start -->
 ## Latest builds
 
-Built automatically by air/OS CI from commit `38e9e8b` on 2026-11-14 ([all files](https://github.com/airos-works/summit/releases/tag/latest)).
+Built automatically by air/OS CI from commit `991ddb4` on 2026-11-15 ([all files](https://github.com/airos-works/summit/releases/tag/latest)).
 
 | Architecture | Package |
 |---|---|
-| arm64 | [summit-0.1.0.git20261113.2040-1-arm64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit-0.1.0.git20261113.2040-1-arm64.hpkg) |
-| arm64 | [summit_webkit-1.10.1.git20261113.2040-1-arm64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkit-1.10.1.git20261113.2040-1-arm64.hpkg) |
-| arm64 | [summit_webkitlegacy-1.10.1.git20261113.2040-1-arm64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkitlegacy-1.10.1.git20261113.2040-1-arm64.hpkg) |
-| x86_64 | [summit-0.1.0.git20261113.2040-1-x86_64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit-0.1.0.git20261113.2040-1-x86_64.hpkg) |
-| x86_64 | [summit_webkit-1.10.1.git20261113.2040-1-x86_64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkit-1.10.1.git20261113.2040-1-x86_64.hpkg) |
-| x86_64 | [summit_webkitlegacy-1.10.1.git20261113.2040-1-x86_64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkitlegacy-1.10.1.git20261113.2040-1-x86_64.hpkg) |
+| arm64 | [summit-0.1.0.git20261115.0925-1-arm64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit-0.1.0.git20261115.0925-1-arm64.hpkg) |
+| arm64 | [summit_webkit-1.10.1.git20261115.0925-1-arm64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkit-1.10.1.git20261115.0925-1-arm64.hpkg) |
+| arm64 | [summit_webkitlegacy-1.10.1.git20261115.0925-1-arm64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkitlegacy-1.10.1.git20261115.0925-1-arm64.hpkg) |
+| x86_64 | [summit-0.1.0.git20261115.0925-1-x86_64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit-0.1.0.git20261115.0925-1-x86_64.hpkg) |
+| x86_64 | [summit_webkit-1.10.1.git20261115.0925-1-x86_64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkit-1.10.1.git20261115.0925-1-x86_64.hpkg) |
+| x86_64 | [summit_webkitlegacy-1.10.1.git20261115.0925-1-x86_64.hpkg](https://github.com/airos-works/summit/releases/download/latest/summit_webkitlegacy-1.10.1.git20261115.0925-1-x86_64.hpkg) |
 
-Install with `pkgman install <file>`, or copy the file into `/boot/system/packages`. Haiku SDK: x86_64 hrev60207-2688-g1b0cfc1c9a, arm64 hrev60207-2688-g1b0cfc1c9a.
+Install with `pkgman install <file>`, or copy the file into `/boot/system/packages`. Haiku SDK: x86_64 hrev60207-2717-g12ad0480dc, arm64 hrev60207-2717-g12ad0480dc.
 <!-- airos-ci:latest-builds:end -->
 
 <!-- airos-ci:haiku-builds:start -->
