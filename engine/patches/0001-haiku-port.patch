@@ -41335,7 +41335,7 @@ index 100e61c99fcc079ca9b363aab12482437ef928c7..c4a67dde3a5846b566a25d6d109e452a
  }
  
 diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp b/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp
-index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d4140426a 100644
+index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..58fac370ada977a2eb183802086d087abe03e4e5 100644
 --- a/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp
 +++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp
 @@ -33,6 +33,10 @@
@@ -41364,7 +41364,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
  
      if (m_animatedBackingStoreClient)
          m_animatedBackingStoreClient->update(layer.owner(), unscaledViewportRect, m_coverRect, unscaledSize, contentsScale);
-@@ -143,6 +154,20 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
+@@ -143,12 +154,68 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
      if (m_pendingTileCreation)
          result.add(UpdateResult::TilesPending);
  
@@ -41382,32 +41382,92 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
 +            m_pendingTileCreation, shouldCreateAndDestroyTiles);
 +#endif
 +
++#if USE(SKIA) && PLATFORM(HAIKU)
++    // Only a tile in view holds up the composition of the page's
++    // rendering update, and with it the next requestAnimationFrame:
++    // pages that scroll themselves (Lenis, GSAP) jumped hundreds of
++    // pixels at once while 50 tiles ahead of the scroll were painted
++    // (getartcraft.com, 250 ms). The compositor takes the others once
++    // they are painted. SUMMIT_TILES_AHEAD_HOLD_UPDATE=1 waits for all.
++    static const bool tilesAheadHoldUpdate = [] {
++        const char* value = getenv("SUMMIT_TILES_AHEAD_HOLD_UPDATE");
++        return value && value[0] == '1' && !value[1];
++    }();
++    // So nothing slows down the repaints of tiles out of view, and the
++    // painting threads take them only when no tile in view is waiting. A
++    // page that repaints part of a large layer in every frame (a 3D view
++    // and its controls on virtualhifi.com, with a window large enough
++    // that the tiles in view kept the painters busy) queued a repaint of
++    // each dirty tile out of view per frame faster than any was painted,
++    // and the compositor keeps a tile's updates until all are painted:
++    // the web process grew by 1 GB a second until the machine's memory
++    // was gone. A tile out of view is repainted again only once its last
++    // repaint is painted; until then it stays dirty, and the layer asks
++    // for another update. SUMMIT_TILES_AHEAD_BACKPRESSURE=0 turns this off.
++    static const bool tilesAheadBackpressure = [] {
++        const char* value = getenv("SUMMIT_TILES_AHEAD_BACKPRESSURE");
++        return !value || value[0] != '0' || value[1];
++    }();
++    auto holdsRenderingUpdate = [&](const Tile& tile) {
++        return tilesAheadHoldUpdate || tile.rect.intersects(m_visibleRect);
++    };
++    auto isStillPaintingAhead = [&](const Tile& tile) {
++        return tilesAheadBackpressure && !holdsRenderingUpdate(tile)
++            && tile.paintingAheadHaiku && !tile.paintingAheadHaiku->isPaintingComplete();
++    };
++    bool tilesWaitForPainting = false;
++#endif
++
      // Update the dirty tiles.
      IntRect tileDirtyRectUnion;
      unsigned dirtyTilesCount = 0;
-@@ -173,7 +198,20 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
+     for (const auto& tile : m_tiles.values()) {
+         if (!tile.isDirty())
+             continue;
++#if USE(SKIA) && PLATFORM(HAIKU)
++        if (isStillPaintingAhead(tile)) {
++            tilesWaitForPainting = true;
++            continue;
++        }
++#endif
+ 
+         tileDirtyRectUnion.unite(tile.dirtyRect);
+         ++dirtyTilesCount;
+@@ -169,11 +236,19 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
+         for (auto& tile : m_tiles.values()) {
+             if (!tile.isDirty())
+                 continue;
++#if USE(SKIA) && PLATFORM(HAIKU)
++            if (isStillPaintingAhead(tile))
++                continue;
++#endif
+ 
              WTFBeginSignpost(this, UpdateTile, "%u/%u, id: %d, rect: %ix%i+%i+%i, dirty: %ix%i+%i+%i", ++dirtyTileIndex, dirtyTilesCount, tile.id,
                  tile.rect.x(), tile.rect.y(), tile.rect.width(), tile.rect.height(), tile.dirtyRect.x(), tile.dirtyRect.y(), tile.dirtyRect.width(), tile.dirtyRect.height());
  
 -#if USE(SKIA)
 +#if USE(SKIA) && PLATFORM(HAIKU)
-+            // Only a tile in view holds up the composition of the page's
-+            // rendering update, and with it the next requestAnimationFrame:
-+            // pages that scroll themselves (Lenis, GSAP) jumped hundreds of
-+            // pixels at once while 50 tiles ahead of the scroll were painted
-+            // (getartcraft.com, 250 ms). The compositor takes the others once
-+            // they are painted. SUMMIT_TILES_AHEAD_HOLD_UPDATE=1 waits for all.
-+            static const bool tilesAheadHoldUpdate = [] {
-+                const char* value = getenv("SUMMIT_TILES_AHEAD_HOLD_UPDATE");
-+                return value && value[0] == '1' && !value[1];
-+            }();
-+            auto buffer = paintingEngine.replay(*layer.owner(), recording.copyRef(), tile.rect, tile.dirtyRect,
-+                tilesAheadHoldUpdate || tile.rect.intersects(m_visibleRect));
++            const bool holds = holdsRenderingUpdate(tile);
++            auto buffer = paintingEngine.replay(*layer.owner(), recording.copyRef(), tile.rect, tile.dirtyRect, holds);
++            tile.paintingAheadHaiku = holds ? nullptr : RefPtr { buffer.ptr() };
 +#elif USE(SKIA)
              auto buffer = paintingEngine.replay(*layer.owner(), recording.copyRef(), tile.rect, tile.dirtyRect);
  #else
              FloatRect scaledDirtyRect(tile.dirtyRect);
-@@ -247,6 +285,9 @@ void CoordinatedBackingStoreProxy::createOrDestroyTiles(const IntRect& unscaledV
+@@ -202,6 +277,12 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
+ #if !HAVE(OS_SIGNPOST) && !USE(SYSPROF_CAPTURE)
+     UNUSED_VARIABLE(dirtyTilesCount);
+ #endif
++#if USE(SKIA) && PLATFORM(HAIKU)
++    // Dirty tiles left for their last repaint to be painted get another
++    // update, even if nothing else changes in the layer.
++    if (tilesWaitForPainting)
++        result.add(UpdateResult::TilesPending);
++#endif
+ 
+     if (tilesToCreate.isEmpty() && tilesToUpdate.isEmpty() && tilesToRemove.isEmpty())
+         return result;
+@@ -247,6 +328,9 @@ void CoordinatedBackingStoreProxy::createOrDestroyTiles(const IntRect& unscaledV
      IntRect visibleRect = mapFromContents(unscaledVisibleRect);
      bool contentsRectChanged = contentsScaleChanged || m_contentsRect != contentsRect;
      bool geometryChanged = contentsRectChanged || m_visibleRect != visibleRect || m_coverAreaMultiplier != coverAreaMultiplier;
@@ -41417,7 +41477,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
      if (!geometryChanged && !m_pendingTileCreation)
          return;
  
-@@ -254,6 +295,9 @@ void CoordinatedBackingStoreProxy::createOrDestroyTiles(const IntRect& unscaledV
+@@ -254,6 +338,9 @@ void CoordinatedBackingStoreProxy::createOrDestroyTiles(const IntRect& unscaledV
          m_contentsRect = contentsRect;
          m_visibleRect = visibleRect;
          m_coverAreaMultiplier = coverAreaMultiplier;
@@ -41427,7 +41487,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
  
          bool tileSizeChanged = false;
          if (!m_contentsRect.isEmpty()) {
-@@ -369,9 +413,21 @@ void CoordinatedBackingStoreProxy::createOrDestroyTiles(const IntRect& unscaledV
+@@ -369,9 +456,21 @@ void CoordinatedBackingStoreProxy::createOrDestroyTiles(const IntRect& unscaledV
          for (const auto& position : tilePositionsToCreate) {
              auto tile = Tile(generateTileID(), tileRectForPosition(position));
  #if ENABLE(DAMAGE_TRACKING)
@@ -41449,7 +41509,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
  #else
              UNUSED_PARAM(damage);
  #endif
-@@ -407,11 +463,14 @@ IntSize CoordinatedBackingStoreProxy::computeTileSize(const IntSize& viewportSiz
+@@ -407,11 +506,14 @@ IntSize CoordinatedBackingStoreProxy::computeTileSize(const IntSize& viewportSiz
          return overridenTileSize;
  
      IntSize tileSize;
@@ -41467,7 +41527,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
          static constexpr int minGPUTileHeight = 256;
  
          auto gpuTileSize = [&](const IntSize& baseSize) -> IntSize {
-@@ -434,9 +493,25 @@ IntSize CoordinatedBackingStoreProxy::computeTileSize(const IntSize& viewportSiz
+@@ -434,9 +536,25 @@ IntSize CoordinatedBackingStoreProxy::computeTileSize(const IntSize& viewportSiz
              tileSize = gpuTileSize(baseSize);
          }
      } else {
@@ -41493,7 +41553,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
          // If the contents width is small, increase tile size vertically.
          if (m_contentsRect.width() < tileSize.width())
              tileSize.setHeight(maxUntiledContentSize);
-@@ -499,6 +574,30 @@ void CoordinatedBackingStoreProxy::adjustForContentsRect(IntRect& rect) const
+@@ -499,6 +617,30 @@ void CoordinatedBackingStoreProxy::adjustForContentsRect(IntRect& rect) const
  
  std::pair<IntRect, IntRect> CoordinatedBackingStoreProxy::computeCoverAndKeepRect() const
  {
@@ -41524,7 +41584,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
      IntRect coverRect = m_visibleRect;
      IntRect keepRect = m_visibleRect;
  
-@@ -513,6 +612,31 @@ std::pair<IntRect, IntRect> CoordinatedBackingStoreProxy::computeCoverAndKeepRec
+@@ -513,6 +655,31 @@ std::pair<IntRect, IntRect> CoordinatedBackingStoreProxy::computeCoverAndKeepRec
  
      adjustForContentsRect(coverRect);
  
@@ -41557,7 +41617,7 @@ index 160ba4f2623722caaf670da2b6eb3f4b1d3f2f5f..5026f486ac8c18e6a9463bf2528fae1d
      keepRect.unite(coverRect);
      keepRect.inflateX(m_tileSize.width() / 2);
 diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.h b/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.h
-index a743e3db140fdd0202145f0c59c13379044127a1..271da6770116cab538ed77f62a91f04a04fead5b 100644
+index a743e3db140fdd0202145f0c59c13379044127a1..c17b4cbf572a94501e6fdcff0c4e6d222b019b60 100644
 --- a/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.h
 +++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.h
 @@ -87,6 +87,9 @@ public:
@@ -41570,7 +41630,19 @@ index a743e3db140fdd0202145f0c59c13379044127a1..271da6770116cab538ed77f62a91f04a
  
      void waitUntilPaintingComplete();
  
-@@ -150,6 +153,10 @@ private:
+@@ -130,6 +133,11 @@ private:
+         uint32_t id { 0 };
+         IntRect rect;
+         IntRect dirtyRect;
++#if PLATFORM(HAIKU)
++        // The buffer of the tile's last repaint while it was out of view,
++        // until the painting threads have painted it (updateIfNeeded()).
++        RefPtr<CoordinatedTileBuffer> paintingAheadHaiku;
++#endif
+     };
+ 
+     CoordinatedBackingStoreProxy() = default;
+@@ -150,6 +158,10 @@ private:
      IntSize m_tileSize;
      float m_coverAreaMultiplier { 2 };
      bool m_pendingTileCreation { false };
@@ -72558,7 +72630,7 @@ index 8723b9e2f90788a74d1ddc536a399463921231ec..90b405c4470f80744e0bee6889b650b5
  
  } // namespace WebKit
 diff --git a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.cpp b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.cpp
-index 3f7acfab36c398a8e7af4c55768bdef27cdac477..5d1746d061d1c9863882e3e02a09b141df03dfd7 100644
+index 3f7acfab36c398a8e7af4c55768bdef27cdac477..66da02fe6249eb2925167697b31d283d007d09b4 100644
 --- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.cpp
 @@ -25,6 +25,7 @@
@@ -72606,7 +72678,24 @@ index 3f7acfab36c398a8e7af4c55768bdef27cdac477..5d1746d061d1c9863882e3e02a09b141
  CoordinatedBackingStoreTile::CoordinatedBackingStoreTile(float scale)
      : m_scale(scale)
  {
-@@ -63,13 +92,36 @@ void CoordinatedBackingStoreTile::ensureTexture(const IntSize& size, Coordinated
+@@ -43,6 +72,16 @@ CoordinatedBackingStoreTile::~CoordinatedBackingStoreTile() = default;
+ 
+ void CoordinatedBackingStoreTile::addUpdate(Update&& update)
+ {
++#if PLATFORM(HAIKU)
++    // An update the new one paints over shows nothing once both are
++    // applied. A tile out of view keeps its updates until every one is
++    // painted (CoordinatedBackingStore::processPendingUpdates()), and one
++    // repainted in every frame kept all of them: a buffer each, about a
++    // megabyte, without end (virtualhifi.com, 1 GB a second).
++    m_updates.removeAllMatching([&](const Update& earlier) {
++        return earlier.tileRect == update.tileRect && update.sourceRect.contains(earlier.sourceRect);
++    });
++#endif
+     m_updates.append(WTF::move(update));
+ }
+ 
+@@ -63,13 +102,36 @@ void CoordinatedBackingStoreTile::ensureTexture(const IntSize& size, Coordinated
  #endif
  
      WTFBeginSignpost(this, AcquireTexture);
@@ -72643,7 +72732,7 @@ index 3f7acfab36c398a8e7af4c55768bdef27cdac477..5d1746d061d1c9863882e3e02a09b141
  void CoordinatedBackingStoreTile::processPendingUpdates()
  {
      auto updates = WTF::move(m_updates);
-@@ -83,7 +135,13 @@ void CoordinatedBackingStoreTile::processPendingUpdates()
+@@ -83,7 +145,13 @@ void CoordinatedBackingStoreTile::processPendingUpdates()
  
          WTFBeginSignpost(this, CoordinatedSwapBuffer, "%u/%zu, rect %ix%i+%i+%i", updateIndex + 1, updatesCount, update.tileRect.x(), update.tileRect.y(), update.tileRect.width(), update.tileRect.height());
  
@@ -72657,7 +72746,7 @@ index 3f7acfab36c398a8e7af4c55768bdef27cdac477..5d1746d061d1c9863882e3e02a09b141
  
          FloatRect unscaledTileRect(update.tileRect);
          unscaledTileRect.scale(1. / m_scale);
-@@ -91,7 +149,13 @@ void CoordinatedBackingStoreTile::processPendingUpdates()
+@@ -91,7 +159,13 @@ void CoordinatedBackingStoreTile::processPendingUpdates()
          if (unscaledTileRect != m_rect) {
              m_rect = unscaledTileRect;
              m_texture = nullptr;
@@ -72671,7 +72760,7 @@ index 3f7acfab36c398a8e7af4c55768bdef27cdac477..5d1746d061d1c9863882e3e02a09b141
  
  #if USE(SKIA)
          if (update.buffer->isBackedByOpenGL()) {
-@@ -118,12 +182,71 @@ void CoordinatedBackingStoreTile::processPendingUpdates()
+@@ -118,12 +192,71 @@ void CoordinatedBackingStoreTile::processPendingUpdates()
          }
  #endif
          auto& buffer = static_cast<CoordinatedUnacceleratedTileBuffer&>(update.buffer.get());
