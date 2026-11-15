@@ -97847,8 +97847,35 @@ index 8004ec61378fe96a582562ae1a9a6253f8a9c198..182a2abe76a51ecb34a3afa7eda2c8c1
      gridItem.layoutIfNeeded();
  }
  
+diff --git a/Source/WebCore/rendering/LayoutRepainter.cpp b/Source/WebCore/rendering/LayoutRepainter.cpp
+index 6b21156853e18241520555e20e5808e79eadb6b2..75cb194046833b975dc9d082cfa7b22ebad8abb4 100644
+--- a/Source/WebCore/rendering/LayoutRepainter.cpp
++++ b/Source/WebCore/rendering/LayoutRepainter.cpp
+@@ -44,12 +44,22 @@ LayoutRepainter::LayoutRepainter(RenderElement& renderer, std::optional<CheckFor
+     m_oldRects = m_renderer->rectsForRepaintingAfterLayout(m_repaintContainer, m_repaintOutlineBounds);
+ }
+ 
++#if PLATFORM(HAIKU)
++// In RenderBlock.cpp.
++bool summitItemLayoutComparesBoundsOnlyHaiku(const RenderElement&);
++#endif
++
+ bool LayoutRepainter::repaintAfterLayout()
+ {
+     if (!m_checkForRepaint)
+         return false;
+ 
+     auto requiresFullRepaint = m_forceFullRepaint || m_renderer->selfNeedsLayout() ? RequiresFullRepaint::Yes : RequiresFullRepaint::No;
++#if PLATFORM(HAIKU)
++    // Laid out only because its container asked: repainted, if at all, when the whole layout is done.
++    if (requiresFullRepaint == RequiresFullRepaint::Yes && !m_forceFullRepaint && summitItemLayoutComparesBoundsOnlyHaiku(m_renderer.get()))
++        return false;
++#endif
+     // Outline bounds are not used if we're doing a full repaint.
+     auto newRects = m_renderer->rectsForRepaintingAfterLayout(m_repaintContainer, (requiresFullRepaint == RequiresFullRepaint::Yes) ? RepaintOutlineBounds::No : m_repaintOutlineBounds);
+     return m_renderer->repaintAfterLayoutIfNeeded(m_repaintContainer, requiresFullRepaint, m_oldRects, newRects);
 diff --git a/Source/WebCore/rendering/RenderBlock.cpp b/Source/WebCore/rendering/RenderBlock.cpp
-index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd3dc83bce 100644
+index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..3f942749eb79943fdc74840a61079ab4fbd2b362 100644
 --- a/Source/WebCore/rendering/RenderBlock.cpp
 +++ b/Source/WebCore/rendering/RenderBlock.cpp
 @@ -93,6 +93,11 @@
@@ -97863,7 +97890,7 @@ index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd
  #include <wtf/SetForScope.h>
  #include <wtf/StackStats.h>
  #include <wtf/TZoneMallocInlines.h>
-@@ -583,9 +588,753 @@ static bool canContainDescendantScrollbarChanges(const RenderBlock& renderBlock,
+@@ -583,9 +588,955 @@ static bool canContainDescendantScrollbarChanges(const RenderBlock& renderBlock,
      return layoutContext.subtreeScrollbarChangesState().has_value() && renderBlock.style().logicalWidth().isFixed();
  }
  
@@ -98245,10 +98272,182 @@ index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd
 +        summitItemsMarkedByContainer().add(item);
 +}
 +
++static bool summitItemBoundsRepaintEnabled()
++{
++    static bool enabled = [] {
++        const char* value = std::getenv("SUMMIT_ITEM_BOUNDS_REPAINT");
++        return !value || value[0] != '0' || value[1];
++    }();
++    return enabled;
++}
++
++// A box that needs layout itself repaints all it holds after each of its
++// layouts (LayoutRepainter, or its layer after the layout), and the blocks it
++// moves rely on that. A grid or flex container marks its items so to measure
++// them and again to stretch them, whether or not anything about them changed:
++// on Shopify pages, whose <body> is a grid, a change anywhere in the page
++// repainted the whole <main> (the whole page layer, 50,000 pixels high) twice
++// in every frame of an animation, and GemPages' flex columns inside grids
++// likewise (virtualhifi.com: 38 fps in a large window, with tiles repainted
++// at 1.6 gigapixels a second).
++//
++// For a block flow that holds only blocks, or a flex box, that paints nothing
++// of its own whose look depends on its geometry, and whose only such mark in
++// a layout is its container's, that repaint is decided once the whole layout
++// is done: if the box ends where it was before the layout and none of its
++// children moved or appeared, nothing is repainted for it (what changed
++// inside repaints itself, as below any box that is not laid out itself);
++// otherwise all of it is, where it was and where it is. Positions during the
++// layout are not final (a grid places an item after laying it out), so
++// nothing is decided before. SUMMIT_ITEM_BOUNDS_REPAINT=0 turns this off.
++static bool summitItemPaintsNothingOfItsOwnHaiku(const RenderElement& renderer)
++{
++    auto* block = dynamicDowncast<RenderBlock>(renderer);
++    auto* blockFlow = dynamicDowncast<RenderBlockFlow>(renderer);
++    if (!block || (!blockFlow && !is<RenderFlexibleBox>(*block)))
++        return false;
++    if (blockFlow && (blockFlow->childrenInline() || blockFlow->containsFloats()))
++        return false;
++    if (block->isAnonymous() || block->isOutOfFlowPositioned() || !block->everHadLayout())
++        return false;
++    auto& style = block->style();
++    if (Style::hasImageInAnyLayer(style.maskLayers()) || style.border().hasVisibleBorderDecoration() || style.hasOutline() || !style.boxShadow().isNone())
++        return false;
++    if (!style.textDecorationLine().isNone() || style.userModify() != UserModify::ReadOnly || style.specifiesColumns())
++        return false;
++    if (block->hasMask() || block->hasFilter() || block->isDocumentElementRenderer() || block->isBody())
++        return false;
++    return true;
++}
++
++// Items without a layer: where they were before this layout.
++struct SummitDeferredItemRepaintHaiku {
++    SingleThreadWeakPtr<const RenderLayerModelObject> container;
++    RenderObject::RepaintRects oldRects;
++    bool repaintsAll { false };
++};
++
++static SingleThreadWeakHashMap<RenderBox, SummitDeferredItemRepaintHaiku>& summitDeferredItemRepaints()
++{
++    static NeverDestroyed<SingleThreadWeakHashMap<RenderBox, SummitDeferredItemRepaintHaiku>> items;
++    return items;
++}
++
++// Items with a layer: the layer compares its bounds after the layout
++// (RenderLayer's repaint after layout, summitLayerRepaintComparesBoundsOnlyHaiku()).
++struct SummitLayeredItemMarkHaiku {
++    SingleThreadWeakPtr<const RenderElement> renderer;
++    unsigned layoutCount;
++};
++
++static Vector<SummitLayeredItemMarkHaiku>& summitLayeredItemsMarkedByContainer()
++{
++    static NeverDestroyed<Vector<SummitLayeredItemMarkHaiku>> items;
++    return items;
++}
++
++// Items that needed layout themselves for another reason in this layout.
++static SingleThreadWeakHashSet<RenderBox>& summitItemsRepaintedWholeThisLayout()
++{
++    static NeverDestroyed<SingleThreadWeakHashSet<RenderBox>> items;
++    return items;
++}
++
++static void summitForgetLayeredItemMark(const RenderElement& renderer)
++{
++    summitLayeredItemsMarkedByContainer().removeAllMatching([&](auto& mark) {
++        return !mark.renderer || mark.renderer.get() == &renderer;
++    });
++}
++
 +void summitSetNeedsLayoutByContainer(RenderBox& item)
 +{
 +    summitNoteMarkByContainer(item);
++    if (summitLayoutReuseEnabled() && summitItemBoundsRepaintEnabled()) {
++        auto& deferred = summitDeferredItemRepaints();
++        if (item.selfNeedsLayout()) {
++            // Marked for another reason (or by this container, not laid out since).
++            if (!deferred.contains(item))
++                summitItemsRepaintedWholeThisLayout().add(item);
++        } else if (!summitItemsRepaintedWholeThisLayout().contains(item) && summitItemPaintsNothingOfItsOwnHaiku(item)) {
++            if (item.hasLayer()) {
++                // The mark below has the layer repaint all of it after the layout (RenderObject::setNeedsLayout()).
++                if (item.layer()->repaintStatus() == RepaintStatus::NeedsNormalRepaint) {
++                    summitForgetLayeredItemMark(item);
++                    summitLayeredItemsMarkedByContainer().append({ item, item.view().frameView().layoutContext().layoutUpdateCount() });
++                }
++            } else if (!deferred.contains(item)) {
++                SingleThreadWeakPtr<const RenderLayerModelObject> container = item.containerForRepaint().renderer.get();
++                auto rects = item.rectsForRepaintingAfterLayout(container.get(), RepaintOutlineBounds::No);
++                deferred.add(item, SummitDeferredItemRepaintHaiku { WTF::move(container), WTF::move(rects), false });
++            }
++        }
++    }
 +    item.setNeedsLayout(MarkingBehavior::MarkOnlyThis);
++}
++
++// For LayoutRepainter: the repaint after this layout of the box is left to the end of the whole layout.
++bool summitItemLayoutComparesBoundsOnlyHaiku(const RenderElement& renderer)
++{
++    auto* box = dynamicDowncast<RenderBox>(renderer);
++    return box && box->selfNeedsLayout() && summitDeferredItemRepaints().contains(*box);
++}
++
++// A child of the box moved or appeared in its layout: the box is repainted whole after all.
++void summitNoteItemChildMovedHaiku(const RenderElement& renderer)
++{
++    auto* box = dynamicDowncast<RenderBox>(renderer);
++    if (!box)
++        return;
++    auto& deferred = summitDeferredItemRepaints();
++    if (!deferred.isEmptyIgnoringNullReferences()) {
++        auto it = deferred.find(*box);
++        if (it != deferred.end())
++            it->value.repaintsAll = true;
++    }
++    if (!summitLayeredItemsMarkedByContainer().isEmpty())
++        summitForgetLayeredItemMark(renderer);
++}
++
++// For the layer of a box: whether the full repaint it asks for after this
++// layout came only from the mark of its container (summitSetNeedsLayoutByContainer()).
++bool summitLayerRepaintComparesBoundsOnlyHaiku(const RenderElement& renderer)
++{
++    auto& marks = summitLayeredItemsMarkedByContainer();
++    if (marks.isEmpty())
++        return false;
++    // Marked in the layout before the count was raised (LocalFrameViewLayoutContext::didLayout()).
++    auto count = renderer.view().frameView().layoutContext().layoutUpdateCount();
++    bool marked = false;
++    marks.removeAllMatching([&](auto& mark) {
++        if (!mark.renderer)
++            return true;
++        if (mark.renderer.get() != &renderer)
++            return false;
++        marked = count == mark.layoutCount + 1;
++        return true;
++    });
++    return marked && summitItemPaintsNothingOfItsOwnHaiku(renderer);
++}
++
++// When the layout of the document is done.
++static void summitRepaintDeferredItems()
++{
++    auto& deferred = summitDeferredItemRepaints();
++    if (deferred.isEmptyIgnoringNullReferences()) {
++        summitItemsRepaintedWholeThisLayout().clear();
++        return;
++    }
++    auto items = WTF::move(deferred);
++    for (auto [item, entry] : items) {
++        SingleThreadWeakPtr<const RenderLayerModelObject> container = item.containerForRepaint().renderer.get();
++        auto rects = item.rectsForRepaintingAfterLayout(container.get(), RepaintOutlineBounds::No);
++        if (!entry.repaintsAll && container == entry.container && rects == entry.oldRects)
++            continue;
++        item.repaintUsingContainer(SingleThreadWeakPtr<const RenderLayerModelObject> { entry.container.get() }, entry.oldRects.clippedOverflowRect);
++        item.repaintUsingContainer(WTF::move(container), rects.clippedOverflowRect);
++    }
++    summitItemsRepaintedWholeThisLayout().clear();
 +}
 +
 +void summitSetChildNeedsLayoutByContainer(RenderBox& item)
@@ -98266,6 +98465,7 @@ index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd
 +void summitForgetItemsMarkedByContainer()
 +{
 +    summitItemsMarkedByContainer().clear();
++    summitRepaintDeferredItems();
 +    summitVerifyPercentHeightChains();
 +    summitVerifyStretchedItems(nullptr);
 +}
@@ -98425,6 +98625,35 @@ index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd
 +    if (before.logicalHeight != now.logicalHeight)
 +        return refuse("height"_s);
 +    return refuse("container-phase"_s);
++}
++
++// A grid stretches an item in the block axis by laying it out again at the
++// stretched height, from a height of zero, after it measured the item
++// without one (RenderGrid::stretchBlockSizeForGridItem()); every stretched
++// item is laid out that way in each layout of the grid. When the stretched
++// height is the height the item already took, a block (not a flex box or a
++// grid, whose content is placed by their size) whose own height and minimum
++// and maximum heights are not percentages and that has no percentage heights
++// inside comes out of that layout as it is (the same rule as
++// summitItemLayoutInputsAreEquivalent()). The layout from zero repainted the
++// whole item: on Shopify pages, whose <body> is a grid, the whole <main> of
++// the page in every frame that changed anything in it (virtualhifi.com,
++// 38 fps in a large window). Off with SUMMIT_LAYOUT_REUSE=0.
++bool summitStretchedHeightKeepsGridItemLayout(const RenderBox& item)
++{
++    if (!summitLayoutReuseEnabled() || summitLayoutReuseVerifies())
++        return false;
++    auto* block = dynamicDowncast<RenderBlockFlow>(item);
++    if (!block || !block->everHadLayout() || block->needsLayout() || block->isOutOfFlowPositioned() || block->isAnonymous())
++        return false;
++    if (block->hasPercentHeightDescendants() || block->hasRelativeLogicalHeight())
++        return false;
++    auto& style = block->style();
++    if (style.logicalMinHeight().isPercentOrCalculated() || style.logicalMaxHeight().isPercentOrCalculated())
++        return false;
++    if (block->enclosingFragmentedFlow() || block->document().inQuirksMode())
++        return false;
++    return true;
 +}
 +#endif
 +
@@ -98617,7 +98846,7 @@ index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd
  
      auto& layoutContext = this->layoutContext();
  
-@@ -609,6 +1358,29 @@ void RenderBlock::layout()
+@@ -609,6 +1560,29 @@ void RenderBlock::layout()
          clearLayoutOverflow();
  
      invalidateBackgroundObscurationStatus();
@@ -98648,7 +98877,7 @@ index 0ff11fddb608c1b65d17189a08c8ffa40c284e90..e6e9da5ea08d84e6f86bf0af301e72fd
  
  RenderBlockRareData* RenderBlock::blockRareData() const
 diff --git a/Source/WebCore/rendering/RenderBlockFlow.cpp b/Source/WebCore/rendering/RenderBlockFlow.cpp
-index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb914460c6f 100644
+index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..7996a4aa1830960e51de28b8e426f7155bda0ffc 100644
 --- a/Source/WebCore/rendering/RenderBlockFlow.cpp
 +++ b/Source/WebCore/rendering/RenderBlockFlow.cpp
 @@ -72,6 +72,7 @@
@@ -98659,7 +98888,7 @@ index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb9
  #include "RenderObjectInlines.h"
  #include "RenderTableCellInlines.h"
  #include "RenderText.h"
-@@ -84,15 +85,29 @@
+@@ -84,15 +85,30 @@
  #include "TextBoxTrimmer.h"
  #include "TextUtil.h"
  #include "VisiblePosition.h"
@@ -98683,13 +98912,14 @@ index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb9
 +class RenderElement;
 +// In RenderElement.cpp.
 +bool summitRootLayoutComparesBoundsOnlyHaiku(const RenderElement&);
++void summitNoteItemChildMovedHaiku(const RenderElement&);
 +}
 +#endif
 +
  namespace WebCore {
  
  WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderBlockFlow);
-@@ -797,8 +812,184 @@ static bool formattingContextRootIntrinsicLogicalWidthsDependOnOwnHeight(const R
+@@ -797,8 +813,184 @@ static bool formattingContextRootIntrinsicLogicalWidthsDependOnOwnHeight(const R
      return false;
  }
  
@@ -98874,15 +99104,19 @@ index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb9
      // Let's not dirty the height percentage descendant when it has an absolutely positioned containing block ancestor. We should be able to dirty such boxes through the regular invalidation logic.
      for (auto* ancestor = descendant.containingBlock(); ancestor && ancestor != this; ancestor = ancestor->containingBlock()) {
          if (ancestor->isOutOfFlowPositioned())
-@@ -1347,7 +1538,15 @@ void RenderBlockFlow::layoutBlockChild(RenderBox& child, MarginInfo& marginInfo,
+@@ -1347,11 +1539,27 @@ void RenderBlockFlow::layoutBlockChild(RenderBox& child, MarginInfo& marginInfo,
          // If the child moved, we have to repaint it as well as any floating/positioned
          // descendants. An exception is if we need a layout. In this case, we know we're going to
          // repaint ourselves (and the child) anyway.
 +#if PLATFORM(HAIKU)
 +        // <html> and <body> may not repaint all they hold after a style change
 +        // that needs their layout (RenderElement::setStyle): then the children
-+        // they move repaint themselves here.
++        // they move repaint themselves here. A grid or flex item laid out only
++        // because its container asked is repainted after the whole layout
++        // (summitSetNeedsLayoutByContainer()), all of it once a child moved.
 +        bool parentRepaintsChild = selfNeedsLayout() && !((isDocumentElementRenderer() || isBody()) && summitRootLayoutComparesBoundsOnlyHaiku(*this));
++        if (parentRepaintsChild)
++            summitNoteItemChildMovedHaiku(*this);
 +        if (childHadLayout && !parentRepaintsChild && child.checkForRepaintDuringLayout())
 +#else
          if (childHadLayout && !selfNeedsLayout() && child.checkForRepaintDuringLayout())
@@ -98890,7 +99124,15 @@ index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb9
              child.repaintDuringLayoutIfMoved(oldRect);
      }
  
-@@ -4363,6 +4562,58 @@ std::pair<float, float> RenderBlockFlow::inlineContentTopAndBottomIncludingInkOv
+     if (!childHadLayout && child.checkForRepaintDuringLayout()) {
++#if PLATFORM(HAIKU)
++        if (selfNeedsLayout())
++            summitNoteItemChildMovedHaiku(*this);
++#endif
+         child.repaint();
+         child.repaintOverhangingFloats(true);
+     }
+@@ -4363,6 +4571,58 @@ std::pair<float, float> RenderBlockFlow::inlineContentTopAndBottomIncludingInkOv
  
  RenderBlockFlow::InlineContentStatus RenderBlockFlow::markInlineContentDirtyForLayout(RelayoutChildren relayoutChildren)
  {
@@ -98949,7 +99191,7 @@ index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb9
      auto contentNeedsNormalChildLayoutOnly = std::optional<bool> { };
      auto hasInFlowBlockLevelElement = false;
      auto hasDirtyInFlowBlockLevelElement = false;
-@@ -4375,7 +4626,78 @@ RenderBlockFlow::InlineContentStatus RenderBlockFlow::markInlineContentDirtyForL
+@@ -4375,7 +4635,78 @@ RenderBlockFlow::InlineContentStatus RenderBlockFlow::markInlineContentDirtyForL
          auto isInFlowBlockLevelElement = box && box->isBlockLevelBox() && box->isInFlow();
          hasInFlowBlockLevelElement |= isInFlowBlockLevelElement;
          hasDirtyInFlowBlockLevelElement |= (isInFlowBlockLevelElement && box->needsLayout());
@@ -99029,7 +99271,7 @@ index 820170c9ccbad7e487a557bcd6549aaeaeb0d9b0..9ca651ae05bd9dc1fe0b62827e652bb9
          auto childNeedsIntrinsicWidthComputation = !renderer.isExcludedFromNormalLayout() && relayoutChildren == RelayoutChildren::Yes && box && box->shouldInvalidateContentWidths();
  
          if (childNeedsLayout)
-@@ -4435,6 +4757,10 @@ RenderBlockFlow::InlineContentStatus RenderBlockFlow::markInlineContentDirtyForL
+@@ -4435,6 +4766,10 @@ RenderBlockFlow::InlineContentStatus RenderBlockFlow::markInlineContentDirtyForL
              continue;
          }
      }
@@ -99670,11 +99912,41 @@ index c30408dbc98900cac30cc19b6a52ac5e1b698120..99122be590285832d919a055302fa425
      if (Style::AnchorPositionEvaluator::isAnchorPositioned(style()))
          Style::AnchorPositionEvaluator::captureScrollSnapshots(downcast<RenderBox>(*this));
  }
+diff --git a/Source/WebCore/rendering/RenderFlexibleBox.cpp b/Source/WebCore/rendering/RenderFlexibleBox.cpp
+index 4fcb18c274244e25bf227cffde32fff4b80dc15a..62cd236ac0264fce597f1f8cd38e75c7b870a476 100644
+--- a/Source/WebCore/rendering/RenderFlexibleBox.cpp
++++ b/Source/WebCore/rendering/RenderFlexibleBox.cpp
+@@ -60,6 +60,13 @@
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/TypeCasts.h>
+ 
++#if PLATFORM(HAIKU)
++namespace WebCore {
++// In RenderBlock.cpp.
++void summitNoteItemChildMovedHaiku(const RenderElement&);
++}
++#endif
++
+ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderFlexibleBox);
+@@ -221,6 +228,11 @@ void RenderFlexibleBox::repaintFlexItemsDuringLayoutIfMoved(const FlexItemBorder
+         // If the child moved, we have to repaint it as well as any floating/positioned
+         // descendants. An exception is if we need a layout. In this case, we know we're going to
+         // repaint ourselves (and the child) anyway.
++#if PLATFORM(HAIKU)
++        // A flex box laid out only because its container asked repaints whole after all (summitSetNeedsLayoutByContainer()).
++        if (selfNeedsLayout() && oldFlexItemRects[index].location() != flexItem.borderBoxRectInContainer().location())
++            summitNoteItemChildMovedHaiku(*this);
++#endif
+         if (!selfNeedsLayout() && flexItem.checkForRepaintDuringLayout())
+             flexItem.repaintDuringLayoutIfMoved(oldFlexItemRects[index]);
+         ++index;
 diff --git a/Source/WebCore/rendering/RenderGrid.cpp b/Source/WebCore/rendering/RenderGrid.cpp
-index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05c18406f0 100644
+index e4016aa11263c14ff1ece803b6abdb2d697c2f75..549874815d5f3abd8d2a4a823907c8abbf8130c6 100644
 --- a/Source/WebCore/rendering/RenderGrid.cpp
 +++ b/Source/WebCore/rendering/RenderGrid.cpp
-@@ -48,12 +48,23 @@
+@@ -48,12 +48,24 @@
  #include "StyleFitTolerance.h"
  #include "StyleGridPositionsResolver.h"
  #include "StylePrimitiveNumericTypes+Evaluation.h"
@@ -99692,13 +99964,14 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
 +namespace WebCore {
 +// Layout reuse for flex and grid items lives in RenderBlock.cpp.
 +void summitSetNeedsLayoutByContainer(RenderBox&);
++bool summitStretchedHeightKeepsGridItemLayout(const RenderBox&);
 +}
 +#endif
 +
  namespace WebCore {
  
  WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderGrid);
-@@ -1653,7 +1664,11 @@ void RenderGrid::updateGridAreaLogicalSize(RenderBox& gridItem, std::optional<La
+@@ -1653,7 +1665,11 @@ void RenderGrid::updateGridAreaLogicalSize(RenderBox& gridItem, std::optional<La
      bool gridAreaWidthChanged = overrideSizeChanged(gridItem, Style::GridTrackSizingDirection::Columns, width, height);
      bool gridAreaHeightChanged = overrideSizeChanged(gridItem, Style::GridTrackSizingDirection::Rows, width, height);
      if (gridAreaWidthChanged || (gridAreaHeightChanged && hasRelativeBlockAxisSize(*this, gridItem)))
@@ -99710,7 +99983,7 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
  
      gridItem.setGridAreaContentLogicalWidth(width);
      gridItem.setGridAreaContentLogicalHeight(height);
-@@ -1686,7 +1701,11 @@ void RenderGrid::layoutGridItems(RenderGridLayoutState& gridLayoutState, GridLan
+@@ -1686,7 +1702,11 @@ void RenderGrid::layoutGridItems(RenderGridLayoutState& gridLayoutState, GridLan
  
          auto* renderGrid = dynamicDowncast<RenderGrid>(gridItem);
          if (renderGrid && (renderGrid->isSubgridColumns() || renderGrid->isSubgridRows()))
@@ -99722,7 +99995,7 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
  
          // Setting the definite grid area's sizes. It may imply that the
          // item must perform a layout if its area differs from the one
-@@ -1701,7 +1720,22 @@ void RenderGrid::layoutGridItems(RenderGridLayoutState& gridLayoutState, GridLan
+@@ -1701,7 +1721,22 @@ void RenderGrid::layoutGridItems(RenderGridLayoutState& gridLayoutState, GridLan
          applyStretchAlignmentToGridItemIfNeeded(gridItem, gridLayoutState);
          applySubgridStretchAlignmentToGridItemIfNeeded(gridItem);
  
@@ -99745,7 +100018,20 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
  
          // We need pending layouts to be done in order to compute auto-margins properly.
          GridLayoutFunctions::updateAutoMarginsIfNeeded(gridItem, writingMode());
-@@ -1897,7 +1931,11 @@ void RenderGrid::stretchBlockSizeForGridItem(RenderBox& gridItem, LayoutUnit ali
+@@ -1887,7 +1922,12 @@ void RenderGrid::stretchBlockSizeForGridItem(RenderBox& gridItem, LayoutUnit ali
+             return true;
+ 
+         if (canSetColumnAxisStretchRequirementForItem(gridItem))
++#if PLATFORM(HAIKU)
++            return gridLayoutState.containsLayoutRequirementForGridItem(gridItem, ItemLayoutRequirement::NeedsColumnAxisStretchAlignment)
++                && !summitStretchedHeightKeepsGridItemLayout(gridItem);
++#else
+             return gridLayoutState.containsLayoutRequirementForGridItem(gridItem, ItemLayoutRequirement::NeedsColumnAxisStretchAlignment);
++#endif
+ 
+         return is<RenderBlock>(gridItem) && downcast<RenderBlock>(gridItem).hasPercentHeightDescendants();
+     }();
+@@ -1897,7 +1937,11 @@ void RenderGrid::stretchBlockSizeForGridItem(RenderBox& gridItem, LayoutUnit ali
      // FIXME: Can avoid laying out here in some cases. See https://webkit.org/b/87905.
      if (itemNeedsRelayoutForStretchAlignment) {
          gridItem.setLogicalHeight(0_lu);
@@ -99757,7 +100043,7 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
      }
  }
  
-@@ -1907,7 +1945,11 @@ void RenderGrid::stretchInlineSizeForGridItem(RenderBox& gridItem, LayoutUnit al
+@@ -1907,7 +1951,11 @@ void RenderGrid::stretchInlineSizeForGridItem(RenderBox& gridItem, LayoutUnit al
      auto desiredLogicalWidth = gridItem.constrainLogicalWidthByMinMax(stretchedLogicalWidth, contentBoxWidth(), *this);
      gridItem.setOverridingBorderBoxLogicalWidth(desiredLogicalWidth);
      if (desiredLogicalWidth != gridItem.logicalWidth())
@@ -99769,7 +100055,7 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
  }
  
  // FIXME: This logic is shared by RenderFlexibleBox, so it should be moved to RenderBox.
-@@ -2704,8 +2746,19 @@ void RenderGrid::updateIntrinsicLogicalHeightsForRowSizingFirstPassCacheAvailabi
+@@ -2704,8 +2752,19 @@ void RenderGrid::updateIntrinsicLogicalHeightsForRowSizingFirstPassCacheAvailabi
  
      if (canCreateIntrinsicLogicalHeightsCacheForRowSizingFirstPass && m_intrinsicLogicalHeightsForRowSizingFirstPass) {
          for (auto& gridItem : childrenOfType<RenderBox>(*this)) {
@@ -99791,7 +100077,7 @@ index e4016aa11263c14ff1ece803b6abdb2d697c2f75..4c4a7d020e2a91fbbe39ab92bc99ae05
      } else if (canCreateIntrinsicLogicalHeightsCacheForRowSizingFirstPass)
          m_intrinsicLogicalHeightsForRowSizingFirstPass.emplace();
 diff --git a/Source/WebCore/rendering/RenderLayer.cpp b/Source/WebCore/rendering/RenderLayer.cpp
-index 4bd303aa17e5da8a780da294d7a1337b8978d6ea..2c3ccf819dc789c9874a9d0725b92ced2abed609 100644
+index 4bd303aa17e5da8a780da294d7a1337b8978d6ea..46d843be01f4444e7b076dbeed9213074d28486b 100644
 --- a/Source/WebCore/rendering/RenderLayer.cpp
 +++ b/Source/WebCore/rendering/RenderLayer.cpp
 @@ -173,6 +173,9 @@
@@ -99804,7 +100090,33 @@ index 4bd303aa17e5da8a780da294d7a1337b8978d6ea..2c3ccf819dc789c9874a9d0725b92ced
  #include <wtf/TZoneMallocInlines.h>
  #include <wtf/text/CString.h>
  #include <wtf/text/MakeString.h>
-@@ -3276,6 +3279,15 @@ void RenderLayer::paint(GraphicsContext& context, const LayoutRect& damageRect,
+@@ -182,6 +185,13 @@
+ #include <WebKitAdditions/AXCustomColorBackdropContext.h>
+ #endif
+ 
++#if PLATFORM(HAIKU)
++namespace WebCore {
++// In RenderBlock.cpp.
++bool summitLayerRepaintComparesBoundsOnlyHaiku(const RenderElement&);
++}
++#endif
++
+ namespace WebCore {
+ 
+ using namespace HTMLNames;
+@@ -1363,6 +1373,11 @@ void RenderLayer::recursiveUpdateLayerPositions(OptionSet<UpdateLayerPositionsFl
+ 
+         if (checkForRepaint && shouldRepaintAfterLayout() && newRects) {
+             auto needsFullRepaint = repaintStatus() == RepaintStatus::NeedsFullRepaint ? RequiresFullRepaint::Yes : RequiresFullRepaint::No;
++#if PLATFORM(HAIKU)
++            // A box laid out only because its container asked, and where it was (summitSetNeedsLayoutByContainer()).
++            if (needsFullRepaint == RequiresFullRepaint::Yes && oldRects && *oldRects == *newRects && summitLayerRepaintComparesBoundsOnlyHaiku(renderer()))
++                return;
++#endif
+             auto resolvedOldRects = valueOrDefault(oldRects);
+             renderer().repaintAfterLayoutIfNeeded(WTF::move(repaintContainer), needsFullRepaint, resolvedOldRects, *newRects);
+         }
+@@ -3276,6 +3291,15 @@ void RenderLayer::paint(GraphicsContext& context, const LayoutRect& damageRect,
          widget->setOverlapTestResult(false);
  }
  
@@ -99820,7 +100132,7 @@ index 4bd303aa17e5da8a780da294d7a1337b8978d6ea..2c3ccf819dc789c9874a9d0725b92ced
  void RenderLayer::clipToRect(GraphicsContext& context, GraphicsContextStateSaver& stateSaver, RegionContextStateSaver& regionContextStateSaver, const LayerPaintingInfo& paintingInfo, OptionSet<PaintBehavior> paintBehavior, const ClipRect& clipRect, BorderRadiusClippingRule rule)
  {
      bool needsClipping = !clipRect.isInfinite() && clipRect.rect() != paintingInfo.paintDirtyRect;
-@@ -3570,6 +3582,20 @@ RenderLayerFilters* RenderLayer::filtersForPainting(GraphicsContext& context, Op
+@@ -3570,6 +3594,20 @@ RenderLayerFilters* RenderLayer::filtersForPainting(GraphicsContext& context, Op
      return &ensureLayerFilters();
  }
  
@@ -99841,7 +100153,7 @@ index 4bd303aa17e5da8a780da294d7a1337b8978d6ea..2c3ccf819dc789c9874a9d0725b92ced
  GraphicsContext* RenderLayer::setupFilters(GraphicsContext& destinationContext, LayerPaintingInfo& paintingInfo, OptionSet<PaintLayerFlag>& paintFlags, const LayoutSize& offsetFromRoot, const ClipRect& backgroundRect)
  {
      auto* paintingFilters = filtersForPainting(destinationContext, paintFlags, paintingInfo.paintBehavior);
-@@ -3579,6 +3605,13 @@ GraphicsContext* RenderLayer::setupFilters(GraphicsContext& destinationContext,
+@@ -3579,6 +3617,13 @@ GraphicsContext* RenderLayer::setupFilters(GraphicsContext& destinationContext,
      LayoutRect filterRepaintRect = paintingFilters->dirtySourceRect();
      filterRepaintRect.move(offsetFromRoot);
  
@@ -99855,7 +100167,7 @@ index 4bd303aa17e5da8a780da294d7a1337b8978d6ea..2c3ccf819dc789c9874a9d0725b92ced
      auto rootRelativeBounds = calculateLayerBounds(paintingInfo.rootLayer, offsetFromRoot, { });
  
      // When the filter is applied via a transparency layer directly on the destination context (e.g. CG drop-shadow),
-@@ -5752,6 +5785,14 @@ LayoutRect RenderLayer::calculateLayerBounds(const RenderLayer* ancestorLayer, c
+@@ -5752,6 +5797,14 @@ LayoutRect RenderLayer::calculateLayerBounds(const RenderLayer* ancestorLayer, c
          // FIXME: border-radius not accounted for.
          // FIXME: Regions not accounted for.
          const RenderLayer* clippingRootLayer = flags & UseLocalClipRectExcludingCompositingIfPossible ? this : clippingRootForPainting();
