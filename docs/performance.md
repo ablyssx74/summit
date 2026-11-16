@@ -47,16 +47,19 @@ from a LAN server on the build host.
 (A server's `Set-Cookie: name=; Max-Age=0` looked as if it did not delete the
 cookie; that was the test server, which never sent the header, #220.)
 
-**Uploads (#216).** Haiku's TCP keeps a socket's send queue at 64 KB (only the
-receive side grows), so an upload had at most 64 KB in flight per round trip.
-Connections now ask for a 256 KB send buffer (`SUMMIT_TCP_SEND_BUFFER`, 0 for
-the default). 10 MB `fetch` POSTs from the X399 to an Ookla server in Sydney
-(22 ms): 2.2-2.8 MB/s before, 6.9-9.6 MB/s after, on every run. A plain C
-client on the X399 managed 19-20 MB/s with 1 MiB, but the curl tool and Summit
-with 512 KB, 1 MiB or 4 MiB were as slow as 64 KB on some runs (the OS's TCP
-recovers badly from the losses a fuller queue causes), so 256 KB is the
-default until that is better (#119). libcurl passes the socket type with
-`SOCK_CLOEXEC` added: the check masks it.
+**Uploads (#216).** Haiku's TCP kept a socket's send queue at 64 KB (only the
+receive side grew), so an upload had at most 64 KB in flight per round trip.
+Connections asked for a 256 KB send buffer instead: 10 MB `fetch` POSTs from
+the X399 to an Ookla server in Sydney (22 ms) went from 2.2-2.8 MB/s to
+6.9-9.6 MB/s (larger buffers were erratic then: the OS's TCP recovered badly
+from the losses a fuller queue causes, #119). air/OS's TCP now grows the send
+queue with the congestion window (haiku aa3cdec157, hrev60207+2648; loss
+recovery fixed up to +2743, haiku#113), but not for a socket whose
+application set `SO_SNDBUF`, so Summit leaves the size to the OS there and
+keeps 256 KB on older systems and stock Haiku (decided from `uname`). Same
+test on +2743: 9.5 MB/s with 256 KB, 25-31 MB/s with the OS's sizing.
+`SUMMIT_TCP_SEND_BUFFER` sets the size in bytes, 0 leaves the OS's. libcurl
+passes the socket type with `SOCK_CLOEXEC` added: the check masks it.
 
 **Hidden pages' video (#209).** A media source video that plays with sound in
 a hidden page (another tab, a minimized window) stops decoding its pictures

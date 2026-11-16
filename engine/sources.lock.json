@@ -11,6 +11,6 @@
   },
   "patch": {
     "path": "engine/patches/0001-haiku-port.patch",
-    "sha256": "368fdc8475f456e025632db63d61ed1f85225844cf920a39597e12dc2568a892"
+    "sha256": "af06d3b75f62e24acc8e4d113b433e5089c321eaa5cd36a20cb0b9ff3fa81203"
   }
 }
