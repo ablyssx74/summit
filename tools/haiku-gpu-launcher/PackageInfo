@@ -1,0 +1,20 @@
+name			summit_gpu
+version			0.1.0-1
+architecture		x86_64
+summary			"Summit with GPU compositing and WebGL (adds a \"Summit GPU\" entry to the Applications menu)"
+description		"Starts the Summit browser with a workaround for a thread-local-storage problem that crashed its web process as soon as it used the GPU (Mesa's Zink through NVK from Nebula). Installs the entry \"Summit GPU\" in /boot/system/apps and the preloaded library libsummit_tlsfix.so. Start Summit through this entry, not directly, to get GPU compositing and WebGL."
+packager		"ablyssx74"
+vendor			"ablyssx74"
+licenses {
+	"MIT"
+}
+copyrights {
+	"2026 ablyssx74"
+}
+provides {
+	summit_gpu = 0.1.0
+}
+requires {
+	haiku
+	summit
+}

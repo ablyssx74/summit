@@ -1,0 +1,15 @@
+#!/bin/sh
+# Starts Summit with the thread-local-storage workaround (see tlsfix.cpp) so that its web process does not crash when it uses the GPU.
+# Arguments are passed on to Summit (a URL, --profile DIR, ...).
+#
+# Summit is started as a child and this script then ends. A script that replaced itself with Summit (exec) when it is started from
+# Deskbar or Tracker leaves Summit stuck at start-up: the system had registered the script's team as an application of its own.
+FIX=/boot/home/config/non-packaged/lib/libsummit_tlsfix.so
+if [ -f "$FIX" ]; then
+    case ":$LD_PRELOAD:" in
+        *":$FIX:"*) ;;
+        *) export LD_PRELOAD="$FIX${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+    esac
+fi
+/boot/system/apps/Summit "$@" > /dev/null 2>&1 &
+exit 0
